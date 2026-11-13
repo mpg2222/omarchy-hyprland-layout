@@ -37,12 +37,21 @@ omarchy-hyprland-layout from-image screenshot.png my-setup
 omarchy-hyprland-layout restore my-setup
 
 # Other commands:
-omarchy-hyprland-layout save <name> [--all]   # snapshot the current desktop
+omarchy-hyprland-layout save <name> [--all]   # snapshot active monitor's desktops
 omarchy-hyprland-layout restore-last          # most recent layout
+omarchy-hyprland-layout restore-last --workspace <id>  # one desktop only
+omarchy-hyprland-layout workspaces-last       # desktops in the last layout
 omarchy-hyprland-layout list | delete <name>
 ```
 
 Layouts are stored in `~/.local/state/omarchy/hyprland-layouts/`.
+Left-click the bar icon to restore the latest layout. Right-click it to save a
+named layout, restore all desktops, or restore one workspace from the latest
+layout.
+
+Restore reports missing windows instead of claiming success when an app cannot
+be matched or launched; successfully restored windows are moved and unpinned
+after launches complete.
 
 ## Vision backend
 

@@ -9,8 +9,8 @@
 #       same arrangement works on any monitor resolution.
 #
 #   omarchy-hyprland-layout save <name> [--all]
-#       Snapshot the current window arrangement (exact pixels, current
-#       monitor; --all for every monitor).
+#       Snapshot every workspace on the active monitor (exact pixels;
+#       --all includes every monitor).
 #
 #   omarchy-hyprland-layout restore <name>
 #       Re-apply a saved layout: open windows are moved and placed at the
@@ -52,6 +52,9 @@ cmd_save() {
   local all=""; [[ "${1:-}" == "--all" ]] && all=1
   local amon; amon=$(active_monitor)
   [[ -n "$amon" ]] || die "could not read the active monitor"
+  local amon_id; amon_id=$(monitors | jq -r --arg m "$amon" 'first(.[] | select(.name==$m)) | .id')
+  [[ "$amon_id" =~ ^[0-9]+$ ]] || die "could not read the active monitor id"
+  local monmap; monmap=$(monitors | jq '[.[] | {(.id|tostring): .name}] | add // {}')
 
   local file="$LAYOUTS_DIR/$name.json" tmp
   # private temp dir: window titles/classes must not be world-readable (0700)
@@ -66,25 +69,44 @@ cmd_save() {
     [[ -z "$pid" ]] && continue
     local cmd=""
     if [[ -r "/proc/$pid/cmdline" ]]; then
-      # shell-quote each argument: joining with spaces loses quoting and
-      # `sh -c "a; b"` would relaunch broken (the window dies instantly)
-      cmd=$(tr '\0' '\n' < "/proc/$pid/cmdline" | head -50 | while IFS= read -r a; do printf '%q ' "$a"; done | sed 's/ *$//')
+      # Use the actual executable; some apps replace argv[0] with a flattened
+      # command line, which would otherwise be shell-quoted as one argument.
+      local exe; exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+      local -a argv=()
+      mapfile -d '' -t argv < "/proc/$pid/cmdline"
+      if [[ -n "$exe" ]]; then
+        printf -v cmd '%q' "$exe"
+        local i arg quoted
+        if (( ${#argv[@]} == 1 )) && [[ "${argv[0]}" == "$exe "* ]]; then
+          local -a flattened_args=()
+          read -r -a flattened_args <<< "${argv[0]#"$exe "}"
+          for arg in "${flattened_args[@]}"; do
+            printf -v quoted '%q' "$arg"
+            cmd+=" $quoted"
+          done
+        else
+          for ((i=1; i<${#argv[@]}; i++)); do
+            printf -v quoted '%q' "${argv[i]}"
+            cmd+=" $quoted"
+          done
+        fi
+      fi
     fi
     [[ -n "$cmd" ]] && printf '%s\t%s\n' "$pid" "$cmd" >> "$cmdmap"
   done < "$tmpdir/pids"
   local jqcmds
   jqcmds=$(jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}' "$cmdmap")
   if [[ -n "$all" ]]; then
-    monitors | jq '[.[] | {name, position: (.position // [.x, .y]), width, height}]' > "$tmp.mon"
-    clients | jq --argjson cmds "$jqcmds" '[.[] | select((.fullscreen|tonumber)==0) | {
-      class: .initialClass, title, workspace: .workspace.id, monitor,
+    monitors | jq '[.[] | {id, name, position: (.position // [.x, .y]), width, height}]' > "$tmp.mon"
+    clients | jq --argjson cmds "$jqcmds" --argjson monmap "$monmap" '[.[] | select((.fullscreen|tonumber)==0) | {
+      class: .initialClass, title, workspace: .workspace.id, monitor: ($monmap[(.monitor|tostring)] // .monitor),
       at, size, floating: (.floating==true), pinned: (.pinned==true),
       launch: ($cmds[(.pid|tostring)] // null)
     }]' > "$tmp.win"
   else
-    monitors | jq --arg m "$amon" '[.[] | select(.name==$m) | {name, position: (.position // [.x, .y]), width, height}]' > "$tmp.mon"
-    clients | jq --arg m "$amon" --argjson cmds "$jqcmds" '[.[] | select(.monitor==$m and (.fullscreen|tonumber)==0) | {
-      class: .initialClass, title, workspace: .workspace.id, monitor,
+    monitors | jq --arg m "$amon" '[.[] | select(.name==$m) | {id, name, position: (.position // [.x, .y]), width, height}]' > "$tmp.mon"
+    clients | jq --argjson m "$amon_id" --arg mname "$amon" --argjson cmds "$jqcmds" '[.[] | select(.monitor==$m and (.fullscreen|tonumber)==0) | {
+      class: .initialClass, title, workspace: .workspace.id, monitor: $mname,
       at, size, floating: (.floating==true), pinned: (.pinned==true),
       launch: ($cmds[(.pid|tostring)] // null)
     }]' > "$tmp.win"
@@ -225,8 +247,8 @@ cmd_from_image() {
 }
 
 # ------------------------------------------------------------- restore
-place_window() { # $1=addr $2=x $3=y $4=w $5=h $6=pinned
-  local addr=$1 x=$2 y=$3 w=$4 h=$5 pin=$6
+place_window() { # $1=addr $2=x $3=y $4=w $5=h
+  local addr=$1 x=$2 y=$3 w=$4 h=$5
   # Exact geometry requires floating: tiled windows are sized by the tiling
   # tree. A restored layout reproduces the arrangement pixel-for-pixel as
   # floating windows, which is what "copy this screenshot" means.
@@ -237,7 +259,7 @@ place_window() { # $1=addr $2=x $3=y $4=w $5=h $6=pinned
   is_float=$(clients | jq -r --arg a "$addr" 'first(.[] | select(.address==$a)) | .floating')
   [[ "$is_float" == "false" ]] && { ev "hl.dispatch(hl.dsp.window.float({window='address:$addr'}))"; sleep 0.25; }
   ev "hl.dispatch(hl.dsp.window.fullscreen_state({window='address:$addr', internal=0, client=0}))"
-  ev "hl.dispatch(hl.dsp.window.pin({window='address:$addr', state=$pin}))"
+  ev "hl.dispatch(hl.dsp.window.pin({window='address:$addr', action='unset'}))"
   ev "hl.dispatch(hl.dsp.window.resize({window='address:$addr', x=$w, y=$h}))"
   sleep 0.15
   ev "hl.dispatch(hl.dsp.window.move({window='address:$addr', x=$x, y=$y}))"
@@ -245,10 +267,17 @@ place_window() { # $1=addr $2=x $3=y $4=w $5=h $6=pinned
 
 cmd_restore() {
   local name="${1:-}"; valid_name "$name"
+  local workspace_filter=""
+  if [[ "${2:-}" == "--workspace" ]]; then
+    workspace_filter="${3:-}"
+    [[ "$workspace_filter" =~ ^-?[0-9]+$ ]] || die "workspace must be a numeric workspace id"
+  elif [[ -n "${2:-}" ]]; then
+    die "usage: restore <name> [--workspace <id>]"
+  fi
   local file="$LAYOUTS_DIR/$name.json"
   [[ -f "$file" ]] || die "no layout named '$name' (list them with: omarchy-hyprland-layout list)"
   local launch_dir; launch_dir=$(mktemp -d)   # temp launch scripts (private)
-  trap 'rm -rf "$launch_dir"' RETURN
+  trap 'rm -rf "$launch_dir"; trap - RETURN' RETURN
 
   local relative; relative=$(jq -r '.relative // false' "$file")
 
@@ -262,25 +291,38 @@ cmd_restore() {
 
   # 1. Pin saved workspaces to their monitors (absolute layouts only).
   if [[ "$relative" != "true" ]]; then
+    local ws_id mon_name
     while IFS=$'\t' read -r ws_id mon_name; do
       [[ -z "$ws_id" || -z "$mon_name" || "$mon_name" == "null" ]] && continue
+      if [[ "$mon_name" =~ ^[0-9]+$ ]]; then
+        mon_name=$(monitors | jq -r --argjson id "$mon_name" 'first(.[] | select(.id==$id)) | .name')
+        [[ -n "$mon_name" && "$mon_name" != "null" ]] || die "could not resolve saved monitor id for workspace $ws_id"
+      fi
       dsp "workspace.move({workspace=$ws_id, monitor='$mon_name'})"
-    done < <(jq -r '.windows[] | "\(.workspace)\t\(.monitor)"' "$file" | sort -u)
+    done < <(jq -r --arg ws "$workspace_filter" '.windows[] | select($ws=="" or (.workspace|tostring)==$ws) | "\(.workspace)\t\(.monitor)"' "$file" | sort -u)
   fi
 
   # 2. Place each window.
   local total; total=$(jq '.windows | length' "$file")
   local used="[]"   # addresses already claimed by this layout: same-class
                     # windows must each match a DIFFERENT window
+  local placements="[]"
+  local missing="[]"
+  local addr ws_id
   local k
   for ((k=0; k<total; k++)); do
-    local wclass wtitle wws x y w h floating pinned launch
+    local wclass wtitle wws x y w h floating launch
     wclass=$(jq -r --argjson i "$k" '.windows[$i].class // empty' "$file")
     wtitle=$(jq -r --argjson i "$k" '.windows[$i].title // empty' "$file")
     wws=$(jq -r --argjson i "$k" '.windows[$i].workspace' "$file")
     launch=$(jq -r --argjson i "$k" '.windows[$i].launch // empty' "$file")
+    # Older saves may contain a flattened argv[0] escaped as one shell word.
+    local launch_exe="${launch%%\\ *}"
+    if [[ "$launch" == "$launch_exe\\ --"* && -x "$launch_exe" ]]; then
+      launch="${launch//\\ / }"
+    fi
     floating=$(jq -r --argjson i "$k" '.windows[$i].floating // false' "$file")
-    pinned=$(jq -r --argjson i "$k" '.windows[$i].pinned // false' "$file")
+    [[ -z "$workspace_filter" || "$wws" == "$workspace_filter" ]] || continue
 
     if [[ "$relative" == "true" ]]; then
       read -r x y w h < <(jq -r --argjson i "$k" --argjson mx "$m_x" --argjson my "$m_y" --argjson mw "$m_w" --argjson mh "$m_h" \
@@ -297,12 +339,12 @@ cmd_restore() {
         # /proc/<pid>/cmdline is world-readable, so --arg would leak saved
         # window titles to any local user during restore
         addr=$(clients | jq -r --arg c "$wclass" --rawfile t <(printf '%s' "$wtitle") --argjson used "$used" \
-          'first(.[] | select((.initialClass==$c and .title==$t) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
+          'first(.[] | select(((.initialClass|ascii_downcase|sub("-browser$"; ""))==($c|ascii_downcase|sub("-browser$"; "")) and .title==$t) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
       fi
       [[ -z "$addr" ]] && addr=$(clients | jq -r --arg c "$wclass" --argjson used "$used" \
-        'first(.[] | select((.initialClass==$c and .workspace.id=='"$wws"') and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
+        'first(.[] | select((.initialClass|ascii_downcase|sub("-browser$"; ""))==($c|ascii_downcase|sub("-browser$"; "")) and .workspace.id=='"$wws"' and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
       [[ -z "$addr" ]] && addr=$(clients | jq -r --arg c "$wclass" --argjson used "$used" \
-        'first(.[] | select((.initialClass==$c) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
+        'first(.[] | select((.initialClass|ascii_downcase|sub("-browser$"; ""))==($c|ascii_downcase|sub("-browser$"; "")) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
       if [[ -z "$addr" && -n "$launch" ]]; then
         # run the launch command through a temp script: Hyprland's exec
         # parser mangles shell metacharacters and quoting in the raw string
@@ -312,7 +354,7 @@ cmd_restore() {
         local t=0
         while (( t < 40 )); do
           addr=$(clients | jq -r --arg c "$wclass" --argjson used "$used" \
-            'first(.[] | select((.initialClass==$c) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
+            'first(.[] | select((.initialClass|ascii_downcase|sub("-browser$"; ""))==($c|ascii_downcase|sub("-browser$"; "")) and ((.address|tostring) as $a | ($used | index($a)) | not))) | .address')
           [[ -n "$addr" ]] && break
           sleep 0.3; ((t++))
         done
@@ -331,14 +373,32 @@ cmd_restore() {
         sleep 0.3; ((t++))
       done
     fi
-    [[ -z "$addr" ]] && continue
+    if [[ -z "$addr" ]]; then
+      missing=$(jq -c --arg c "$wclass" --arg t "$wtitle" --argjson ws "$wws" \
+        '. + [{class:$c, title:$t, workspace:$ws}]' <<<"$missing")
+      continue
+    fi
     used=$(jq -c --arg a "$addr" '. + [$a]' <<<"$used")
+    placements=$(jq -c --arg a "$addr" --argjson ws "$wws" '. + [{address:$a, workspace:$ws}]' <<<"$placements")
 
     dsp "window.move({window='address:$addr', workspace=$wws})"
     sleep 0.15
-    place_window "$addr" "$x" "$y" "$w" "$h" "$pinned"
+    place_window "$addr" "$x" "$y" "$w" "$h"
   done
 
+  while IFS=$'\t' read -r addr ws_id; do
+    [[ -n "$addr" && -n "$ws_id" ]] || continue
+    ev "hl.dispatch(hl.dsp.window.move({window='address:$addr', workspace=$ws_id}))"
+    ev "hl.dispatch(hl.dsp.window.pin({window='address:$addr', action='unset'}))"
+  done < <(jq -r '.[] | "\(.address)\t\(.workspace)"' <<<"$placements")
+
+  local missing_count; missing_count=$(jq 'length' <<<"$missing")
+  if (( missing_count > 0 )); then
+    jq -r '.[] | "workspace \(.workspace): \(.class) - \(.title)"' <<<"$missing" >&2
+    notify "Layout '$name' partially restored ($missing_count window(s) missing)"
+    echo "Layout '$name' partially restored ($missing_count window(s) missing)." >&2
+    return 1
+  fi
   notify "Layout '$name' restored"
   echo "Layout '$name' restored."
 }
@@ -350,7 +410,17 @@ cmd_restore_last() {
     [[ -z "$newest" || "$f" -nt "$newest" ]] && newest="$f"
   done
   [[ -n "$newest" ]] || die "no layouts saved yet"
-  cmd_restore "$(basename "$newest" .json)"
+  cmd_restore "$(basename "$newest" .json)" "$@"
+}
+
+cmd_workspaces_last() {
+  local newest="" f
+  shopt -s nullglob
+  for f in "$LAYOUTS_DIR"/*.json; do
+    [[ -z "$newest" || "$f" -nt "$newest" ]] && newest="$f"
+  done
+  [[ -n "$newest" ]] || die "no layouts saved yet"
+  jq -r '.windows | sort_by(.workspace) | group_by(.workspace)[] | "\(.[0].workspace)\t\(length)"' "$newest"
 }
 
 cmd_list() {
@@ -375,7 +445,8 @@ case "${1:-}" in
   from-image) shift; cmd_from_image "$@" ;;
   save)       shift; cmd_save "$@" ;;
   restore)    shift; cmd_restore "$@" ;;
-  restore-last) cmd_restore_last ;;
+  restore-last) shift; cmd_restore_last "$@" ;;
+  workspaces-last) cmd_workspaces_last ;;
   list)       cmd_list ;;
   delete)     shift; cmd_delete "$@" ;;
   *) cat <<'EOF'
@@ -383,11 +454,15 @@ Usage:
   omarchy-hyprland-layout from-image <screenshot.png> [name]
       define a layout by pasting a screenshot of your desktop
   omarchy-hyprland-layout save <name> [--all]
-      snapshot the current window arrangement
+      snapshot every workspace on the active monitor
   omarchy-hyprland-layout restore <name>
       apply a saved layout
+  omarchy-hyprland-layout restore <name> --workspace <id>
+      restore only one saved desktop (workspace)
   omarchy-hyprland-layout restore-last
       apply the most recently saved layout (used by the bar widget)
+  omarchy-hyprland-layout workspaces-last
+      list desktops in the most recently saved layout
   omarchy-hyprland-layout list | delete <name>
 EOF
     exit 1 ;;
