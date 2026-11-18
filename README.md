@@ -44,6 +44,27 @@ omarchy-hyprland-layout workspaces-last       # desktops in the last layout
 omarchy-hyprland-layout list | delete <name>
 ```
 
+## Top bar size
+
+The Omarchy top bar's height and icon sizes are configurable here too, and
+travel with your layouts: `save` records them, and a full `restore` puts them
+back (a single-desktop `restore --workspace` leaves the bar alone).
+
+```bash
+omarchy-hyprland-layout bar                      # show current values
+omarchy-hyprland-layout bar scale 115            # bar + icons 15% over Omarchy's default
+omarchy-hyprland-layout bar set size-horizontal 44
+omarchy-hyprland-layout bar set icon-size 14
+omarchy-hyprland-layout bar reset                # back to the theme's sizes
+```
+
+Keys: `size-horizontal` (bar height), `size-vertical` (side-bar width),
+`icon-slot`, `icon-canvas`, `icon-font`, `icon-size`, `status-slot`, and
+`scale-with-font` (`true`/`false`). Values are written to the `[bar]` section
+of `~/.config/omarchy/shell.toml` (backed up first; other sections are kept),
+which overrides the theme and survives theme changes. The shell reloads it
+live. Bar text follows the shell-wide font size and is not changed here.
+
 Layouts are stored in `~/.local/state/omarchy/hyprland-layouts/`.
 Left-click the bar icon to restore the latest layout. Right-click it to save a
 named layout, restore all desktops, or restore one workspace from the latest

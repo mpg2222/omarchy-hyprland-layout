@@ -19,6 +19,10 @@
 #
 #   omarchy-hyprland-layout list | delete <name>
 #
+#   omarchy-hyprland-layout bar [show | set <key> <value> | scale <percent> | reset]
+#       Omarchy top bar height/icon sizes ([bar] in ~/.config/omarchy/shell.toml).
+#       `save` records them in the layout and `restore` puts them back.
+#
 # Vision backend for from-image (any OpenAI-compatible endpoint):
 #   OMARCHY_LAYOUT_VISION_URL    default http://127.0.0.1:1234/v1 (LM Studio)
 #   OMARCHY_LAYOUT_VISION_MODEL  default: first model the endpoint serves
@@ -113,7 +117,9 @@ cmd_save() {
   fi
   jq -n --slurpfile mon "$tmp.mon" --slurpfile win "$tmp.win" --arg name "$name" \
      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '{version: 2, name: $name, savedAt: $ts, relative: false, monitors: $mon[0], windows: $win[0]}' > "$file"
+     --argjson bar "$(bar_read)" \
+     '{version: 2, name: $name, savedAt: $ts, relative: false, monitors: $mon[0], windows: $win[0]}
+      + (if ($bar | length) > 0 then {bar: $bar} else {} end)' > "$file"
   rm -rf "$tmpdir"
   local n; n=$(jq '.windows | length' "$file")
   notify "Layout '$name' saved ($n windows)"
@@ -281,6 +287,12 @@ cmd_restore() {
 
   local relative; relative=$(jq -r '.relative // false' "$file")
 
+  # Saved top-bar size settings come back with a full restore (not --workspace).
+  if [[ -z "$workspace_filter" ]] && jq -e '(.bar // {}) | length > 0' "$file" >/dev/null 2>&1; then
+    local saved_bar; saved_bar=$(jq -c '.bar' "$file")
+    [[ "$saved_bar" == "$(bar_read | jq -c .)" ]] || bar_write "$saved_bar"
+  fi
+
   # For relative layouts, resolve the target monitor now (the focused one).
   local m_x=0 m_y=0 m_w=0 m_h=0
   if [[ "$relative" == "true" ]]; then
@@ -441,6 +453,102 @@ cmd_delete() {
   echo "Layout '$name' deleted."
 }
 
+# ------------------------------------------------------------------ bar
+# Omarchy top-bar size settings live in the [bar] section of the machine-level
+# ~/.config/omarchy/shell.toml (they override the theme's and survive theme
+# changes; the shell hot-reloads the file). Only these keys are touched.
+SHELL_TOML="${OMARCHY_SHELL_TOML:-$HOME/.config/omarchy/shell.toml}"
+BAR_SIZE_KEYS=(size-horizontal size-vertical icon-slot icon-canvas icon-font icon-size status-slot)
+declare -A BAR_DEFAULTS=([size-horizontal]=26 [size-vertical]=28 [icon-slot]=27 [icon-canvas]=16 [icon-font]=13 [icon-size]=12 [status-slot]=21)
+
+valid_bar_key() {
+  [[ "$1" == "scale-with-font" ]] && return 0
+  local k; for k in "${BAR_SIZE_KEYS[@]}"; do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
+
+# [bar] section of shell.toml as a JSON object of strings (only known keys).
+bar_read() {
+  [[ -f "$SHELL_TOML" ]] || { echo '{}'; return; }
+  awk '
+    /^[[:space:]]*\[/ { inbar = ($0 ~ /^[[:space:]]*\[bar\][[:space:]]*$/); next }
+    inbar && /^[[:space:]]*[A-Za-z-]+[[:space:]]*=/ {
+      line = $0; sub(/[[:space:]]*#.*$/, "", line)
+      split(line, kv, "="); k = kv[1]; v = kv[2]
+      gsub(/[[:space:]"]/, "", k); gsub(/[[:space:]"]/, "", v)
+      print k "\t" v
+    }' "$SHELL_TOML" |
+  while IFS=$'\t' read -r k v; do valid_bar_key "$k" && printf '%s\t%s\n' "$k" "$v"; done |
+  jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}'
+}
+
+# Replace the [bar] section with the given JSON object ({} removes it).
+# Other sections and unknown [bar] keys are kept; the old file is backed up.
+bar_write() {
+  local json="$1" tmp
+  mkdir -p "$(dirname "$SHELL_TOML")"
+  [[ -f "$SHELL_TOML" ]] && cp -a "$SHELL_TOML" "$SHELL_TOML.bak.$(date +%s)"
+  tmp=$(mktemp)
+  local known; known=$(printf '%s|' "${BAR_SIZE_KEYS[@]}" scale-with-font); known=${known%|}
+  {
+    if [[ -f "$SHELL_TOML" ]]; then
+      awk -v known="^[[:space:]]*($known)[[:space:]]*=" '
+        /^[[:space:]]*\[/ { inbar = ($0 ~ /^[[:space:]]*\[bar\][[:space:]]*$/); if (inbar) { held = 1; next } }
+        inbar && $0 ~ known { next }
+        inbar && /^[[:space:]]*(#|$)/ { next }
+        inbar { extra = extra $0 "\n"; next }
+        { print }
+        END { if (held) printf "%s", extra > "/dev/stderr" }' "$SHELL_TOML" 2>"$tmp.extra"
+    fi
+    if [[ "$json" != "{}" ]] || [[ -s "$tmp.extra" && -n "$(tr -d '[:space:]' < "$tmp.extra")" ]]; then
+      echo "[bar]"
+      jq -r 'to_entries[] | "\(.key) = \(.value)"' <<<"$json"
+      [[ -s "$tmp.extra" ]] && grep -v '^[[:space:]]*$' "$tmp.extra"
+    fi
+  } > "$tmp"
+  mv "$tmp" "$SHELL_TOML"; rm -f "$tmp.extra"
+}
+
+cmd_bar() {
+  local sub="${1:-show}"; shift || true
+  local cur; cur=$(bar_read)
+  case "$sub" in
+    show)
+      local k v
+      echo "Top bar settings ($SHELL_TOML):"
+      for k in "${BAR_SIZE_KEYS[@]}"; do
+        v=$(jq -r --arg k "$k" '.[$k] // empty' <<<"$cur")
+        printf '  %-16s %-5s %s\n' "$k" "${v:-${BAR_DEFAULTS[$k]}}" "$([[ -n $v ]] && echo "(set; default ${BAR_DEFAULTS[$k]})" || echo "(default)")"
+      done
+      v=$(jq -r '.["scale-with-font"] // empty' <<<"$cur")
+      printf '  %-16s %-5s\n' scale-with-font "${v:-true}" ;;
+    set)
+      local key="${1:-}" val="${2:-}"
+      valid_bar_key "$key" || die "unknown bar key '$key' (one of: ${BAR_SIZE_KEYS[*]} scale-with-font)"
+      if [[ "$key" == "scale-with-font" ]]; then
+        [[ "$val" == "true" || "$val" == "false" ]] || die "scale-with-font must be true or false"
+      else
+        [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 200 )) || die "$key must be a whole number from 1 to 200"
+      fi
+      bar_write "$(jq -c --arg k "$key" --arg v "$val" '.[$k] = $v' <<<"$cur")"
+      echo "Bar $key = $val" ;;
+    scale)
+      local pct="${1:-}"
+      [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 50 && pct <= 300 )) || die "usage: bar scale <percent 50-300> (100 = Omarchy default size)"
+      local next="$cur" k v
+      for k in "${BAR_SIZE_KEYS[@]}"; do
+        v=$(( (BAR_DEFAULTS[$k] * pct + 50) / 100 ))
+        next=$(jq -c --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$next")
+      done
+      bar_write "$next"
+      echo "Bar scaled to ${pct}% of the Omarchy default."; cmd_bar show ;;
+    reset)
+      bar_write '{}'
+      echo "Bar size settings removed; the theme's defaults apply again." ;;
+    *) die "usage: bar [show | set <key> <value> | scale <percent> | reset]" ;;
+  esac
+}
+
 case "${1:-}" in
   from-image) shift; cmd_from_image "$@" ;;
   save)       shift; cmd_save "$@" ;;
@@ -449,6 +557,7 @@ case "${1:-}" in
   workspaces-last) cmd_workspaces_last ;;
   list)       cmd_list ;;
   delete)     shift; cmd_delete "$@" ;;
+  bar)        shift; cmd_bar "$@" ;;
   *) cat <<'EOF'
 Usage:
   omarchy-hyprland-layout from-image <screenshot.png> [name]
@@ -464,6 +573,15 @@ Usage:
   omarchy-hyprland-layout workspaces-last
       list desktops in the most recently saved layout
   omarchy-hyprland-layout list | delete <name>
+  omarchy-hyprland-layout bar [show]
+      show the Omarchy top bar size settings
+  omarchy-hyprland-layout bar set <key> <value>
+      keys: size-horizontal size-vertical icon-slot icon-canvas
+            icon-font icon-size status-slot scale-with-font
+  omarchy-hyprland-layout bar scale <percent>
+      resize bar + icons together (100 = Omarchy default)
+  omarchy-hyprland-layout bar reset
+      remove the overrides (theme defaults)
 EOF
     exit 1 ;;
 esac
