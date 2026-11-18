@@ -55,6 +55,7 @@ omarchy-hyprland-layout bar                      # show current values
 omarchy-hyprland-layout bar scale 115            # bar + icons 15% over Omarchy's default
 omarchy-hyprland-layout bar set size-horizontal 44
 omarchy-hyprland-layout bar set icon-size 14
+omarchy-hyprland-layout bar grow 5               # +5% from the current size (-5 shrinks)
 omarchy-hyprland-layout bar reset                # back to the theme's sizes
 ```
 
@@ -64,6 +65,28 @@ Keys: `size-horizontal` (bar height), `size-vertical` (side-bar width),
 of `~/.config/omarchy/shell.toml` (backed up first; other sections are kept),
 which overrides the theme and survives theme changes. The shell reloads it
 live. Bar text follows the shell-wide font size and is not changed here.
+
+## Displays
+
+Right-click the bar icon and drag the screens under **Displays** to arrange
+them; nearby edges snap together. **Apply arrangement** writes the rules into a
+marked block in `~/.config/hypr/monitors.lua` (backed up first), matched by
+each screen's EDID description, so a monitor keeps its place whichever port or
+dock output it comes up on. `save` records the arrangement and a full `restore`
+puts it back when the same screens are connected.
+
+```bash
+omarchy-hyprland-layout displays                        # JSON list of screens
+omarchy-hyprland-layout displays apply '[{"desc":"...","x":0,"y":0}]'
+```
+
+If Display Switch has saved an override (it beats `monitors.lua`), applying an
+arrangement sets that file aside.
+
+## Look'n'Feel in the same menu
+
+When the Look'n'Feel plugin (`meperdonas.looknfeel`) is installed, its panel
+opens from this menu, so its own bar icon can be removed from the bar.
 
 Layouts are stored in `~/.local/state/omarchy/hyprland-layouts/`.
 Left-click the bar icon to restore the latest layout. Right-click it to save a

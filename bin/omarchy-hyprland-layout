@@ -117,9 +117,10 @@ cmd_save() {
   fi
   jq -n --slurpfile mon "$tmp.mon" --slurpfile win "$tmp.win" --arg name "$name" \
      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     --argjson bar "$(bar_read)" \
+     --argjson bar "$(bar_read)" --argjson displays "$(displays_json)" \
      '{version: 2, name: $name, savedAt: $ts, relative: false, monitors: $mon[0], windows: $win[0]}
-      + (if ($bar | length) > 0 then {bar: $bar} else {} end)' > "$file"
+      + (if ($bar | length) > 0 then {bar: $bar} else {} end)
+      + {displays: ($displays | map({desc, name, x, y, scale, transform}))}' > "$file"
   rm -rf "$tmpdir"
   local n; n=$(jq '.windows | length' "$file")
   notify "Layout '$name' saved ($n windows)"
@@ -291,6 +292,20 @@ cmd_restore() {
   if [[ -z "$workspace_filter" ]] && jq -e '(.bar // {}) | length > 0' "$file" >/dev/null 2>&1; then
     local saved_bar; saved_bar=$(jq -c '.bar' "$file")
     [[ "$saved_bar" == "$(bar_read | jq -c .)" ]] || bar_write "$saved_bar"
+  fi
+  # ...and so does the monitor arrangement, when the saved screens are all here
+  # and something differs (position, scale or rotation).
+  if [[ -z "$workspace_filter" ]] && jq -e '(.displays // []) | length > 0' "$file" >/dev/null 2>&1; then
+    local saved_disp live_disp
+    saved_disp=$(jq -c '.displays' "$file")
+    live_disp=$(displays_json)
+    if jq -e --argjson live "$live_disp" '
+        ($live | map({(.desc): .}) | add // {}) as $l |
+        all(.[]; $l[.desc] != null) and
+        any(.[]; ($l[.desc] | [.x, .y, .scale, .transform]) != [.x, .y, .scale, .transform])' <<<"$saved_disp" >/dev/null; then
+      displays_apply "$saved_disp" >/dev/null || echo "Could not restore the display arrangement." >&2
+      sleep 1
+    fi
   fi
 
   # For relative layouts, resolve the target monitor now (the focused one).
@@ -542,10 +557,93 @@ cmd_bar() {
       done
       bar_write "$next"
       echo "Bar scaled to ${pct}% of the Omarchy default."; cmd_bar show ;;
+    grow)
+      local delta="${1:-}"
+      [[ "$delta" =~ ^[+-]?[0-9]+$ ]] && (( ${delta#+} >= -50 && ${delta#+} <= 100 )) || die "usage: bar grow <percent, e.g. 5 or -5>"
+      delta=${delta#+}
+      local next="$cur" k v
+      for k in "${BAR_SIZE_KEYS[@]}"; do
+        v=$(jq -r --arg k "$k" '.[$k] // empty' <<<"$cur"); v=${v:-${BAR_DEFAULTS[$k]}}
+        v=$(( (v * (100 + delta) + 50) / 100 )); (( v < 1 )) && v=1
+        next=$(jq -c --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$next")
+      done
+      bar_write "$next"
+      echo "Bar grown by ${delta}%: height $(jq -r '.["size-horizontal"]' <<<"$next")px" ;;
+    height)
+      jq -r --arg d "${BAR_DEFAULTS[size-horizontal]}" '.["size-horizontal"] // $d' <<<"$cur" ;;
     reset)
       bar_write '{}'
       echo "Bar size settings removed; the theme's defaults apply again." ;;
-    *) die "usage: bar [show | set <key> <value> | scale <percent> | reset]" ;;
+    *) die "usage: bar [show | set <key> <value> | scale <percent> | grow <percent> | height | reset]" ;;
+  esac
+}
+
+# ------------------------------------------------------------- displays
+# Monitor arrangement. Rules are written by EDID description (not port), so a
+# screen keeps its place whichever port or dock output it comes up on. They go
+# in a marked "desk layout" block in ~/.config/hypr/monitors.lua; Display
+# Switch's override file (which would beat monitors.lua) is set aside first.
+MONITORS_LUA="${OMARCHY_MONITORS_LUA:-$HOME/.config/hypr/monitors.lua}"
+DS_OVERRIDE="$HOME/.local/state/omarchy/toggles/hypr/display-switch.lua"
+DESK_BEGIN="-- >>> desk layout (managed by Saved desktop layouts) >>>"
+DESK_END="-- <<< desk layout <<<"
+
+# Enabled monitors with logical (scaled, rotated) sizes.
+displays_json() {
+  monitors | jq -c '[.[] | select(.disabled != true) |
+    (if (.transform % 2) == 1 then [.height, .width] else [.width, .height] end) as $wh |
+    { name, desc: .description, x, y, scale, transform,
+      w: (($wh[0] / .scale) | round), h: (($wh[1] / .scale) | round),
+      internal: (.name | test("^(eDP|LVDS|DSI)")) }]'
+}
+
+# $1 = JSON array of {desc, name?, x, y, scale?, transform?}. Writes and reloads.
+displays_apply() {
+  local in="$1" cur
+  jq -e 'type == "array" and length > 0 and all(.[];
+      (.desc | type == "string" and test("^[A-Za-z0-9 ._()+-]+$")) and
+      (.x | type == "number") and (.y | type == "number") and
+      ((.name // "") | test("^[A-Za-z0-9._-]*$")))' <<<"$in" >/dev/null \
+    || die "displays: expected [{desc, x, y}] with plain monitor descriptions"
+  cur=$(displays_json)
+  # Fill scale/transform/internal from the live monitor when not given.
+  local rules
+  rules=$(jq -r --argjson cur "$cur" '
+    ($cur | map({(.desc): .}) | add // {}) as $live |
+    (map(.x) | min) as $mx | (map(.y) | min) as $my |
+    .[] | ($live[.desc] // {}) as $l |
+    (.scale // $l.scale // 1) as $s | (.transform // $l.transform // 0) as $t |
+    ((.name // $l.name // "") | test("^(eDP|LVDS|DSI)")) as $int |
+    "hl.monitor({ output = \"" + (if $int then (.name // $l.name) else "desc:" + .desc end) +
+    "\", mode = \"preferred\", position = \"" + ((.x - $mx) | round | tostring) + "x" + ((.y - $my) | round | tostring) +
+    "\", scale = " + ($s | tostring) + ", transform = " + ($t | tostring) + " })"' <<<"$in") || die "displays: could not build rules"
+
+  [[ -f "$MONITORS_LUA" ]] && cp -a "$MONITORS_LUA" "$MONITORS_LUA.bak.$(date +%s)"
+  local tmp; tmp=$(mktemp)
+  # Drop any earlier desk-layout block (old or new marker style), then append.
+  awk '/^-- >>> desk layout/ {skip=1} !skip {print} /^-- <<< desk layout/ {skip=0; next}' "$MONITORS_LUA" 2>/dev/null \
+    | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$tmp"
+  { printf '\n%s\n' "$DESK_BEGIN"; printf '%s\n' "$rules"; printf '%s\n' "$DESK_END"; } >> "$tmp"
+  mv "$tmp" "$MONITORS_LUA"
+  if [[ -f "$DS_OVERRIDE" ]]; then
+    mv "$DS_OVERRIDE" "$MONITORS_LUA.display-switch.bak.$(date +%s)"
+    echo "Set aside Display Switch's override (it would beat monitors.lua)."
+  fi
+  hyprctl reload >/dev/null 2>&1
+  local errs; errs=$(hyprctl configerrors 2>/dev/null)
+  [[ -z "$errs" || "$errs" == *"no errors"* ]] || { echo "$errs" >&2; die "Hyprland reported config errors (backup is next to monitors.lua)"; }
+  echo "Displays arranged ($(jq length <<<"$in") screens)."
+}
+
+cmd_displays() {
+  case "${1:-show}" in
+    show|json) displays_json ;;
+    apply)
+      local arg="${2:-}"
+      [[ "$arg" == "-" ]] && arg=$(cat)
+      [[ -n "$arg" ]] || die "usage: displays apply '<json>' | -"
+      displays_apply "$arg" ;;
+    *) die "usage: displays [show | apply '<json>' | apply -]" ;;
   esac
 }
 
@@ -558,6 +656,7 @@ case "${1:-}" in
   list)       cmd_list ;;
   delete)     shift; cmd_delete "$@" ;;
   bar)        shift; cmd_bar "$@" ;;
+  displays)   shift; cmd_displays "$@" ;;
   *) cat <<'EOF'
 Usage:
   omarchy-hyprland-layout from-image <screenshot.png> [name]
@@ -580,8 +679,14 @@ Usage:
             icon-font icon-size status-slot scale-with-font
   omarchy-hyprland-layout bar scale <percent>
       resize bar + icons together (100 = Omarchy default)
+  omarchy-hyprland-layout bar grow <percent>
+      grow (or shrink, with -5) the bar + icons from their current size
   omarchy-hyprland-layout bar reset
       remove the overrides (theme defaults)
+  omarchy-hyprland-layout displays
+      list screens (JSON: desc, position, logical size, scale)
+  omarchy-hyprland-layout displays apply '<json>'
+      arrange screens: [{"desc": "...", "x": 0, "y": 0}, ...]
 EOF
     exit 1 ;;
 esac
