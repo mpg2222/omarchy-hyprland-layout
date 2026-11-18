@@ -83,6 +83,26 @@ omarchy-hyprland-layout displays apply '[{"desc":"...","x":0,"y":0}]'
 If Display Switch has saved an override (it beats `monitors.lua`), applying an
 arrangement sets that file aside.
 
+## Screen idle
+
+The menu's **Screen idle** section sets when the screensaver starts and when the
+screen locks and the displays turn off (Omarchy blanks them a few seconds after
+locking), with separate lock times for plugged in and on battery. **−** / **+**
+step through Never, 1, 2, 5, 10, 15, 20, 30, 45 min, 1 h, 1 h 30 and 2 h.
+
+```bash
+omarchy-hyprland-layout idle                          # current values (JSON, seconds)
+omarchy-hyprland-layout idle set screensaver 600      # 0 = never
+omarchy-hyprland-layout idle set ac-lock 3600
+omarchy-hyprland-layout idle set battery-lock 900
+```
+
+The screensaver time is `idle.screensaver` in `~/.config/omarchy/shell.json`.
+The two lock times are kept in `~/.config/omarchy/idle-power.json`; a small
+user service (`idle-power-profile`) reads that file and sets `idle.lock` for the
+current power source. Without that service, the time for the current power
+source is still applied when you change it.
+
 ## Look'n'Feel in the same menu
 
 When the Look'n'Feel plugin (`meperdonas.looknfeel`) is installed, its panel

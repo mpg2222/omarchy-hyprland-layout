@@ -647,6 +647,67 @@ cmd_displays() {
   esac
 }
 
+# ----------------------------------------------------------------- idle
+# Screensaver start and lock/display-off times (seconds; 0 = never). Omarchy
+# turns the displays off a few seconds after the screen locks, so the lock time
+# is the display-off time. Screensaver goes straight into idle.screensaver in
+# shell.json. The plugged-in and battery lock times go into idle-power.json,
+# which the idle-power-profile user service reads to pick idle.lock by power
+# source; the current one is also written to shell.json right away.
+SHELL_JSON="${OMARCHY_SHELL_JSON:-$HOME/.config/omarchy/shell.json}"
+IDLE_PROFILE="${OMARCHY_IDLE_PROFILE:-$HOME/.config/omarchy/idle-power.json}"
+IDLE_ADAPTER="${OMARCHY_IDLE_ADAPTER:-}"
+
+on_ac() {
+  local a
+  if [[ -n "$IDLE_ADAPTER" ]]; then a="$IDLE_ADAPTER"
+  else a=$(grep -l '^Mains$' /sys/class/power_supply/*/type 2>/dev/null | head -1); a=${a%/type}/online; fi
+  [[ "$(cat "$a" 2>/dev/null)" == 1 ]]
+}
+
+shell_json_set() { # $1 = jq path expr, $2 = number
+  [[ -f "$SHELL_JSON" ]] || echo '{}' > "$SHELL_JSON"
+  local tmp; tmp=$(mktemp "$SHELL_JSON.XXXX") || return 1
+  jq --argjson v "$2" "$1 = \$v" "$SHELL_JSON" > "$tmp" && chmod --reference="$SHELL_JSON" "$tmp" && mv "$tmp" "$SHELL_JSON"
+}
+
+idle_json() {
+  local prof='{}'; [[ -f "$IDLE_PROFILE" ]] && prof=$(jq -c '.' "$IDLE_PROFILE" 2>/dev/null || echo '{}')
+  local ac=false; on_ac && ac=true
+  local service=false
+  systemctl --user is-active --quiet idle-power-profile.service 2>/dev/null && service=true
+  jq -c --argjson prof "$prof" --argjson ac "$ac" --argjson svc "$service" '{
+      screensaver: (.idle.screensaver // 150),
+      lock: (.idle.lock // 300),
+      ac_lock: ($prof.ac_lock // (.idle.lock // 300)),
+      battery_lock: ($prof.battery_lock // (.idle.lock // 300)),
+      on_ac: $ac, service: $svc }' "$SHELL_JSON" 2>/dev/null || echo '{}'
+}
+
+cmd_idle() {
+  case "${1:-show}" in
+    show|json) idle_json ;;
+    set)
+      local which="${2:-}" secs="${3:-}"
+      [[ "$secs" =~ ^[0-9]+$ ]] && (( secs <= 86400 )) || die "idle: seconds must be 0 (never) to 86400"
+      case "$which" in
+        screensaver) shell_json_set '.idle.screensaver' "$secs" || die "idle: could not write $SHELL_JSON" ;;
+        ac-lock|battery-lock)
+          local key=${which/-/_} prof='{}'
+          [[ -f "$IDLE_PROFILE" ]] && prof=$(jq -c '.' "$IDLE_PROFILE" 2>/dev/null || echo '{}')
+          local tmp; tmp=$(mktemp "$IDLE_PROFILE.XXXX") || die "idle: cannot write $IDLE_PROFILE"
+          jq --arg k "$key" --argjson v "$secs" '.[$k] = $v' <<<"$prof" > "$tmp" && mv "$tmp" "$IDLE_PROFILE"
+          # Apply now if it is the one for the current power source.
+          if { [[ "$which" == ac-lock ]] && on_ac; } || { [[ "$which" == battery-lock ]] && ! on_ac; }; then
+            shell_json_set '.idle.lock' "$secs" || die "idle: could not write $SHELL_JSON"
+          fi ;;
+        *) die "usage: idle set screensaver|ac-lock|battery-lock <seconds, 0 = never>" ;;
+      esac
+      echo "idle $which = $secs" ;;
+    *) die "usage: idle [show | set screensaver|ac-lock|battery-lock <seconds>]" ;;
+  esac
+}
+
 case "${1:-}" in
   from-image) shift; cmd_from_image "$@" ;;
   save)       shift; cmd_save "$@" ;;
@@ -657,6 +718,7 @@ case "${1:-}" in
   delete)     shift; cmd_delete "$@" ;;
   bar)        shift; cmd_bar "$@" ;;
   displays)   shift; cmd_displays "$@" ;;
+  idle)       shift; cmd_idle "$@" ;;
   *) cat <<'EOF'
 Usage:
   omarchy-hyprland-layout from-image <screenshot.png> [name]
@@ -687,6 +749,10 @@ Usage:
       list screens (JSON: desc, position, logical size, scale)
   omarchy-hyprland-layout displays apply '<json>'
       arrange screens: [{"desc": "...", "x": 0, "y": 0}, ...]
+  omarchy-hyprland-layout idle
+      screensaver and lock/display-off times (JSON, seconds)
+  omarchy-hyprland-layout idle set screensaver|ac-lock|battery-lock <seconds>
+      0 = never; ac/battery lock times feed the idle-power-profile service
 EOF
     exit 1 ;;
 esac

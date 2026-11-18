@@ -22,6 +22,9 @@ BarWidget {
   property var displays: []      // live screens from `displays`
   property var draft: []         // arrangement being edited
   property bool draftDirty: false
+  property var idle: ({})        // from `idle`: screensaver, ac_lock, battery_lock, on_ac, service
+  // Seconds; 0 = never. The − / + buttons step through these.
+  readonly property var idlePresets: [0, 60, 120, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200]
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -42,6 +45,36 @@ BarWidget {
     if (!workspacesProc.running) workspacesProc.running = true
     if (!barHeightProc.running) barHeightProc.running = true
     if (!displaysProc.running) displaysProc.running = true
+    if (!idleProc.running) idleProc.running = true
+  }
+
+  function formatIdle(secs) {
+    var s = Number(secs)
+    if (!isFinite(s) || s <= 0) return "Never"
+    if (s < 60) return s + " s"
+    var m = Math.round(s / 60)
+    if (m < 60) return m + " min"
+    var h = Math.floor(m / 60), rest = m % 60
+    return h + " h" + (rest ? " " + rest + " min" : "")
+  }
+
+  // Next preset above/below the current value (dir = +1 or -1).
+  function stepIdle(which, current, dir) {
+    if (idleSetProc.running) return
+    var cur = Number(current) || 0
+    var list = idlePresets, next = cur
+    if (dir > 0) {
+      for (var i = 0; i < list.length; i++) if (list[i] > cur) { next = list[i]; break }
+    } else {
+      for (var j = list.length - 1; j >= 0; j--) if (list[j] < cur) { next = list[j]; break }
+    }
+    if (next === cur) return
+    var copy = {}
+    for (var k in idle) copy[k] = idle[k]
+    copy[which === "screensaver" ? "screensaver" : (which === "ac-lock" ? "ac_lock" : "battery_lock")] = next
+    idle = copy
+    idleSetProc.command = [cli, "idle", "set", which, String(next)]
+    idleSetProc.running = true
   }
 
   function restoreWorkspace(id) {
@@ -205,6 +238,25 @@ BarWidget {
     onExited: function(exitCode) {
       root.notify(exitCode === 0 ? "Display arrangement saved." : "Could not arrange the displays.")
       displaysProc.running = true
+    }
+  }
+
+  Process {
+    id: idleProc
+    command: [root.cli, "idle"]
+    stdout: StdioCollector {
+      id: idleOut
+      onStreamFinished: {
+        try { root.idle = JSON.parse(String(idleOut.text || "{}")) } catch (e) { root.idle = ({}) }
+      }
+    }
+  }
+
+  Process {
+    id: idleSetProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.notify("Could not change the idle timer.")
+      idleProc.running = true
     }
   }
 
@@ -439,6 +491,82 @@ BarWidget {
         Button { text: "Smaller"; enabled: !barProc.running; onClicked: root.barCommand(["grow", "-5"]) }
         Button { text: "Larger";  enabled: !barProc.running; onClicked: root.barCommand(["grow", "5"]) }
         Button { text: "Default"; enabled: !barProc.running; onClicked: root.barCommand(["reset"]) }
+      }
+
+      // ---------------------------------------------------- idle timers
+      Text {
+        textFormat: Text.PlainText
+        text: "Screen idle" + (root.idle.on_ac === undefined ? "" : (root.idle.on_ac ? "  ·  plugged in" : "  ·  on battery"))
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+        topPadding: Style.space(6)
+      }
+
+      Repeater {
+        model: [
+          { which: "screensaver", label: "Screensaver starts", key: "screensaver" },
+          { which: "ac-lock", label: "Lock / off · plugged in", key: "ac_lock" },
+          { which: "battery-lock", label: "Lock / off · battery", key: "battery_lock" }
+        ]
+        Item {
+          required property var modelData
+          width: actions.width
+          height: idleMinus.implicitHeight
+          readonly property var value: root.idle[modelData.key]
+
+          Text {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - idleControls.width - Style.space(6)
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: parent.modelData.label
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            id: idleControls
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+            Button {
+              id: idleMinus
+              text: "−"
+              enabled: !idleSetProc.running && parent.parent.value !== undefined
+              onClicked: root.stepIdle(parent.parent.modelData.which, parent.parent.value, -1)
+            }
+            Text {
+              width: Style.space(78)
+              anchors.verticalCenter: parent.verticalCenter
+              horizontalAlignment: Text.AlignHCenter
+              textFormat: Text.PlainText
+              text: parent.parent.value === undefined ? "…" : root.formatIdle(parent.parent.value)
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            Button {
+              text: "+"
+              enabled: !idleSetProc.running && parent.parent.value !== undefined
+              onClicked: root.stepIdle(parent.parent.modelData.which, parent.parent.value, 1)
+            }
+          }
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: root.idle.service === false
+        width: actions.width
+        wrapMode: Text.WordWrap
+        text: "The plugged-in/battery switch needs the idle-power-profile service; it isn't running."
+        color: Qt.darker(root.bar.foreground, 1.4)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       // ---------------------------------------------------- look'n'feel

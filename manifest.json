@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.aishag80g-stack.hyprland-layout",
   "name": "Saved desktop layouts",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "aishag80g-stack",
   "description": "One hotkey restores your favorite desktop: apps launch, windows land in place at their saved size. Works on any Hyprland — Omarchy, Fedora, Arch.",
   "kinds": [
