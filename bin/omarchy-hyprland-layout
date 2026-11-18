@@ -635,15 +635,94 @@ displays_apply() {
   echo "Displays arranged ($(jq length <<<"$in") screens)."
 }
 
+# Screens the desk layout expects (descriptions from the managed block).
+expected_descs() {
+  [[ -f "$MONITORS_LUA" ]] || return 0
+  awk '/^-- >>> desk layout/ {in_b=1; next} /^-- <<< desk layout/ {in_b=0} in_b' "$MONITORS_LUA" |
+    sed -nE 's/.*output = "desc:([^"]+)".*/\1/p'
+}
+
+short_label() { # desc -> "S34J55x …3584" / name for internal
+  local d="$1" parts
+  read -r -a parts <<<"$d"
+  local n=${#parts[@]}
+  (( n >= 2 )) && printf '%s …%s' "${parts[n-2]}" "${parts[n-1]: -4}" || printf '%s' "$d"
+}
+
+dpms_externals() { # $1 = enable|disable
+  local name
+  while read -r name; do
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    hyprctl dispatch "hl.dsp.dpms({ action = \"$1\", monitor = \"$name\" })" >/dev/null 2>&1 || true
+  done < <(monitors | jq -r '.[] | select(.name | test("^(eDP|LVDS|DSI)") | not) | .name')
+}
+
+# Re-detect screens: re-apply the config (re-enables screens a runtime rule
+# turned off and puts returning ones back in place), reconcile the laptop panel
+# with the lid, and blink external screens (DPMS off/on) so a monitor whose
+# input was switched away re-trains its link. Only DPMS is touched, never
+# "disabled", so no screen is ever left off; DPMS always comes back on.
+# --restart-dock also restarts the DisplayLink service (asks for a password),
+# which makes a DisplayLink dock re-read monitors it stopped reporting.
+cmd_displays_scan() {
+  local restart_dock=""; [[ "${1:-}" == "--restart-dock" ]] && restart_dock=1
+  local before; before=$(displays_json | jq -r '.[].desc')
+
+  if [[ -n "$restart_dock" ]]; then
+    if systemctl list-unit-files displaylink.service >/dev/null 2>&1; then
+      pkexec systemctl restart displaylink.service || die "DisplayLink restart was cancelled or failed"
+      sleep 8
+    else
+      echo "No DisplayLink service on this system; skipping dock restart." >&2
+    fi
+  fi
+
+  hyprctl reload >/dev/null 2>&1
+  command -v omarchy-hyprland-monitor-clamshell >/dev/null && omarchy-hyprland-monitor-clamshell >/dev/null 2>&1
+  sleep 1
+  trap 'dpms_externals enable' EXIT
+  dpms_externals disable; sleep 1.5; dpms_externals enable
+  trap - EXIT
+  sleep 3
+  hyprctl reload >/dev/null 2>&1; sleep 1
+
+  local live; live=$(displays_json)
+  local found=() new=() missing=() d
+  while IFS= read -r d; do [[ -n "$d" ]] && found+=("$d"); done < <(jq -r '.[].desc' <<<"$live")
+  for d in "${found[@]}"; do grep -qxF -- "$d" <<<"$before" || new+=("$d"); done
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    printf '%s\n' "${found[@]}" | grep -qxF -- "$d" || missing+=("$d")
+  done < <(expected_descs)
+
+  local labels=() l
+  for d in "${found[@]}"; do
+    if jq -e --arg d "$d" 'any(.[]; .desc == $d and .internal)' <<<"$live" >/dev/null; then labels+=("Laptop")
+    else labels+=("$(short_label "$d")"); fi
+  done
+  local msg="Displays: $(IFS=,; echo "${labels[*]}" | sed 's/,/, /g')"
+  if (( ${#new[@]} )); then
+    msg+=" — back: $(for d in "${new[@]}"; do short_label "$d"; echo -n ", "; done | sed 's/, $//')"
+  fi
+  if (( ${#missing[@]} )); then
+    msg+=" — missing: $(for d in "${missing[@]}"; do short_label "$d"; echo -n ", "; done | sed 's/, $//')"
+    [[ -z "$restart_dock" ]] && lsusb 2>/dev/null | grep -qi '17e9:' && msg+=" (on the dock? try Restart dock video)"
+  fi
+  notify "$msg"
+  echo "$msg"
+  jq -nc --argjson n "${#new[@]}" --argjson m "${#missing[@]}" --argjson f "${#found[@]}" '{found: $f, back: $n, missing: $m}' >&2
+}
+
 cmd_displays() {
   case "${1:-show}" in
+    scan) shift; cmd_displays_scan "$@"; return ;;
     show|json) displays_json ;;
     apply)
       local arg="${2:-}"
       [[ "$arg" == "-" ]] && arg=$(cat)
       [[ -n "$arg" ]] || die "usage: displays apply '<json>' | -"
       displays_apply "$arg" ;;
-    *) die "usage: displays [show | apply '<json>' | apply -]" ;;
+    *) die "usage: displays [show | apply '<json>' | apply - | scan [--restart-dock]]" ;;
   esac
 }
 
@@ -749,6 +828,9 @@ Usage:
       list screens (JSON: desc, position, logical size, scale)
   omarchy-hyprland-layout displays apply '<json>'
       arrange screens: [{"desc": "...", "x": 0, "y": 0}, ...]
+  omarchy-hyprland-layout displays scan [--restart-dock]
+      re-detect screens and put them back in place (--restart-dock also
+      restarts DisplayLink, asking for a password)
   omarchy-hyprland-layout idle
       screensaver and lock/display-off times (JSON, seconds)
   omarchy-hyprland-layout idle set screensaver|ac-lock|battery-lock <seconds>

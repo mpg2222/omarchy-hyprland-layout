@@ -80,6 +80,19 @@ omarchy-hyprland-layout displays                        # JSON list of screens
 omarchy-hyprland-layout displays apply '[{"desc":"...","x":0,"y":0}]'
 ```
 
+**Scan for displays** re-detects screens, for example after you switch a
+shared monitor's input back to this computer: it re-applies the arrangement,
+re-enables screens that were turned off, and briefly blinks the external
+screens so their links re-train (no screen is ever left off). A notification
+lists the screens found, which came back, and which are still missing. If a
+missing screen is on a DisplayLink dock, **Restart dock video** restarts the
+DisplayLink service (it asks for your password) so the dock re-reads its
+monitors.
+
+```bash
+omarchy-hyprland-layout displays scan [--restart-dock]
+```
+
 If Display Switch has saved an override (it beats `monitors.lua`), applying an
 arrangement sets that file aside.
 

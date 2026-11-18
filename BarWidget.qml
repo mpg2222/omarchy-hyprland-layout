@@ -22,6 +22,8 @@ BarWidget {
   property var displays: []      // live screens from `displays`
   property var draft: []         // arrangement being edited
   property bool draftDirty: false
+  property string scanResult: ""
+  property bool scanMissing: false
   property var idle: ({})        // from `idle`: screensaver, ac_lock, battery_lock, on_ac, service
   // Seconds; 0 = never. The − / + buttons step through these.
   readonly property var idlePresets: [0, 60, 120, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200]
@@ -146,6 +148,13 @@ BarWidget {
     draftDirty = true
   }
 
+  function scanDisplays(restartDock) {
+    if (scanProc.running) return
+    scanResult = restartDock ? "Restarting dock video…" : "Scanning…"
+    scanProc.command = restartDock ? [cli, "displays", "scan", "--restart-dock"] : [cli, "displays", "scan"]
+    scanProc.running = true
+  }
+
   function applyDisplays() {
     if (applyProc.running || draft.length === 0) return
     var payload = draft.map(function(d) {
@@ -257,6 +266,22 @@ BarWidget {
     onExited: function(exitCode) {
       if (exitCode !== 0) root.notify("Could not change the idle timer.")
       idleProc.running = true
+    }
+  }
+
+  Process {
+    id: scanProc
+    stdout: StdioCollector {
+      id: scanOut
+      onStreamFinished: {
+        var text = String(scanOut.text || "").trim()
+        root.scanResult = text
+        root.scanMissing = text.indexOf("missing:") !== -1
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && root.scanResult.indexOf("Displays:") !== 0) root.scanResult = "Scan did not finish (cancelled?)."
+      displaysProc.running = true
     }
   }
 
@@ -473,6 +498,34 @@ BarWidget {
           enabled: root.draftDirty && !applyProc.running
           onClicked: { root.draft = root.copyScreens(root.displays); root.draftDirty = false }
         }
+      }
+
+      Row {
+        spacing: Style.space(6)
+        Button {
+          text: scanProc.running ? "Scanning…" : "Scan for displays"
+          tooltipText: "Re-detect screens (e.g. after switching a monitor's input back) and put them back in place"
+          enabled: !scanProc.running && !applyProc.running
+          onClicked: root.scanDisplays(false)
+        }
+        Button {
+          text: "Restart dock video"
+          tooltipText: "Restart DisplayLink so the dock re-reads its monitors (asks for your password)"
+          visible: root.scanMissing
+          enabled: !scanProc.running
+          onClicked: root.scanDisplays(true)
+        }
+      }
+
+      Text {
+        visible: root.scanResult !== ""
+        width: actions.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: root.scanResult
+        color: Qt.darker(root.bar.foreground, 1.2)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       // ---------------------------------------------------- bar size
